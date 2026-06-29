@@ -28,14 +28,13 @@ from QEfficient.base.onnx_transforms import (
 )
 from QEfficient.base.pytorch_transforms import PytorchTransform
 from QEfficient.blocking.blocking_configurator import build_transformer_blocking_config_for_transform
+from QEfficient.compile.mdp_generator import (
+    MdpStrategy,
+    generate_disagg_mdp_config,
+    generate_mdp_partition_config,
+)
 from QEfficient.compile.qnn_compiler import compile as qnn_compile
 from QEfficient.generation.cloud_infer import QAICInferenceSession
-from QEfficient.transformers.models._layerwise import (
-    get_layerwise_end,
-    get_layerwise_start,
-    get_layerwise_total_layers,
-    is_layerwise_active,
-)
 from QEfficient.transformers.models.pytorch_transforms import (
     BlockingAttentionTransform,
     ReplicateKVHeadTransform,
@@ -47,7 +46,6 @@ from QEfficient.utils import (
     create_json,
     create_model_params,
     dump_qconfig,
-    generate_mdp_partition_config,
     get_attr_or_key,
     hash_dict_params,
     load_json,
@@ -109,6 +107,10 @@ class QEFFBaseModel(ABC):
     :_onnx_transforms: ONNX transformations to be applied after ONNX export.
     """
 
+    _start = 0
+    _end = 0
+    _total_layers = None
+    _layerwise_active = False
     _pytorch_transforms: List[PytorchTransform]
     _onnx_transforms = [BaseOnnxTransform]
 
@@ -432,7 +434,7 @@ class QEFFBaseModel(ABC):
             input_names = aligned_input_names
 
         try:
-            with layerwise_safe_onnx_export_patches(enabled=is_layerwise_active(self.model)):
+            with layerwise_safe_onnx_export_patches():
                 torch.onnx.export(
                     self.model,
                     (),
@@ -463,7 +465,7 @@ class QEFFBaseModel(ABC):
 
             # Keep this strictly layerwise-scoped so regular non-layerwise export
             # remains backward compatible.
-            if is_layerwise_active(self.model):
+            if QEFFBaseModel._layerwise_active:
                 _restore_retained_state_output_names(model, output_names)
 
             # Add metadata to the model
@@ -504,6 +506,9 @@ class QEFFBaseModel(ABC):
             "use_onnx_subfunctions": use_onnx_subfunctions,
             "retain_full_kv": retain_full_kv,
         }
+        layerwise_cache_probe = compiler_options.pop("_layerwise_cache_probe", False)
+        if layerwise_cache_probe:
+            kwargs["_layerwise_cache_probe"] = True
         if kv_cache_prefix:
             kwargs["kv_cache_prefix"] = kv_cache_prefix
 
@@ -558,8 +563,8 @@ class QEFFBaseModel(ABC):
         **export_kwargs,
     ) -> str:
         cache_probe = export_kwargs.pop("_layerwise_cache_probe", False)
-        idx = int(get_layerwise_start(self.model))
-        end_idx = int(get_layerwise_end(self.model) or idx + 1)
+        idx = int(QEFFBaseModel._start)
+        end_idx = int(getattr(QEFFBaseModel, "_end", idx + 1))
         if end_idx <= idx:
             raise ValueError(f"Invalid export window: start={idx}, end={end_idx}")
 
@@ -576,7 +581,7 @@ class QEFFBaseModel(ABC):
         # under the export root (new layout) or final_data/ (legacy layout),
         # skip per-window export entirely. This preserves hash-stable reruns
         # without re-exporting layer shards.
-        total_layers = int(get_layerwise_total_layers(self.model))
+        total_layers = int(getattr(QEFFBaseModel, "_total_layers", 0) or 0)
         cached_merged_paths = []
         if total_layers > 0:
             cached_merged_paths.append(export_dir / f"merged_0-{total_layers}.onnx")
@@ -591,9 +596,6 @@ class QEFFBaseModel(ABC):
                 return self.onnx_path
         if cache_probe:
             return None
-
-        # check if the model is in meta state or weights are offloaded
-        self._model_offloaded_check()
 
         export_dir.mkdir(parents=True, exist_ok=True)
 
@@ -689,10 +691,6 @@ class QEFFBaseModel(ABC):
                 val for i, val in enumerate(example_inputs["compressed_kvs"]) if i < window_size
             ]
 
-        # if "past_key_values" in example_inputs:
-        #     example_inputs["past_key_values"] = [
-        #         val for i, val in enumerate(example_inputs["past_key_values"]) if i < window_size
-        #     ]
         if "past_key_values" in example_inputs:
             pkv_layers = _resolve_pkv_layers(example_inputs["past_key_values"])
             if pkv_layers is not None:
@@ -747,7 +745,7 @@ class QEFFBaseModel(ABC):
             dynamic_axes = {rename_map.get(k, k): v for k, v in dynamic_axes.items()}
             input_names = aligned_input_names
         if not os.path.isfile(layer_onnx_path):
-            with layerwise_safe_onnx_export_patches(enabled=bool(prefill_only) and is_layerwise_active(self.model)):
+            with layerwise_safe_onnx_export_patches(enabled=bool(prefill_only)):
                 torch.onnx.export(
                     self.model,
                     (),
@@ -834,6 +832,7 @@ class QEFFBaseModel(ABC):
         specializations: Optional[List[Dict[str, int]]] = None,
         custom_io: Optional[Dict[str, str]] = None,
         mdp_ts_num_devices: int = 1,
+        mdp_num_partitions: Optional[int] = 1,
         num_speculative_tokens: Optional[Union[int, List[int]]] = None,
         enable_qnn: Optional[bool] = False,
         qnn_config: Optional[str] = None,
@@ -857,6 +856,11 @@ class QEFFBaseModel(ABC):
             :specializations (list): List of specializations to compile for
             :custom_io (dict): Custom IO to specify the input and outputs in different formats than default
             :mdp_ts_num_devices (int): Number of devices to partition to use Multi-Device Partitioning with tensor-slicing.
+            :mdp_num_partitions (int): Number of pipeline-parallel partitions for disaggregated prefill serving.
+                When > 1, the ONNX graph is read directly to generate a fully-populated MDP partition
+                config (nodeList per partition) without requiring a compiler round-trip.
+                Ignored when ``mdp_load_partition_config`` is already provided in compiler_options.
+                Defaults to 1 (template / tensor-slice MDP, existing behaviour).
             :num_speculative_tokens (int | List[int], optional): Number of speculative tokens for TLM decode. A plain int K compiles one decode specialization (seq_len=K+1). A list [K0, K1, ...] compiles one specialization per value, enabling per-step dispatch to the cheapest kernel.
             :enable_qnn (bool): Enables QNN Compilation. ``Defaults to False.``
             :qnn_config (str): Path of QNN Config parameters file. Any extra parameters for QNN compilation can be passed via this file. ``Defaults to None.``
@@ -873,6 +877,11 @@ class QEFFBaseModel(ABC):
 
         layerwise_cache_probe = compiler_options.pop("_layerwise_cache_probe", False)
         moe_prefill_packed_chunk_size = compiler_options.pop("moe_prefill_packed_chunk_size", None)
+
+        mdp_ts_json_path = compiler_options.pop("mdp_load_partition_config", None)
+        mdp_strategy = MdpStrategy(compiler_options.pop("mdp_strategy", MdpStrategy.ONNX))
+        mdp_compiler_dump_path = compiler_options.pop("mdp_compiler_dump_path", None)
+
         if onnx_path is None:
             # If weights were offloaded after export, compiling must use the existing
             # ONNX because re-exporting is no longer possible. Otherwise export for
@@ -895,7 +904,7 @@ class QEFFBaseModel(ABC):
                     kv_cache_prefix=kv_cache_prefix,
                     **compiler_options,
                 )
-        if is_layerwise_active(getattr(self, "model", None)):
+        if QEFFBaseModel._layerwise_active:
             if onnx_path is None:
                 return None
             onnx_path = Path(onnx_path)
@@ -935,22 +944,41 @@ class QEFFBaseModel(ABC):
             + [f"-m={onnx_path}"]
         )
 
-        # MDP partition config: prioritize dump over load
-        mdp_dump_json_path = compiler_options.pop("mdp_dump_partition_config", None)
-        mdp_ts_json_path = compiler_options.pop("mdp_load_partition_config", None)
+        # MDP partition config selection (highest priority first):
+        #   1. User-provided pre-built MDP JSON (mdp_load_partition_config).
+        #   2. Disaggregated (pipeline-parallel) MDP — generated from ONNX topsort.
+        #      Strategy ONNX (default): full superset from ONNX graph (~19 MB).
+        #      Strategy INTERSECTION: intersect with compiler dump; compact (~1-2 MB),
+        #        requires a prior -mdp-dump-partition-config run.
+        #   3. Template (tensor-slice) MDP — single partition, nodeList absent.
         mdp_ts_json = None
 
-        if mdp_dump_json_path:
-            if mdp_ts_json_path:
-                logger.warning(
-                    "Loading and Dumping partition is not supported at the same time. Prioritizing dump config over load config!"
-                )
-            command.append(f"-mdp-dump-partition-config={mdp_dump_json_path}")
-        elif mdp_ts_json_path:
+        if mdp_ts_json_path:
             command.append(f"-mdp-load-partition-config={mdp_ts_json_path}")
             mdp_ts_json = load_json(str(mdp_ts_json_path))
-        elif mdp_ts_num_devices > 1:
-            # Generate mdp config only if neither dump nor load is provided and num_devices > 1
+        elif mdp_num_partitions > 1:
+            # Disaggregated (pipeline-parallel) MDP — delegate to focused helper.
+            num_cores = compiler_options.get("aic_num_cores", constants.DEFAULT_AIC_NUM_CORES)
+            num_layers = getattr(self, "num_layers", None)
+            if getattr(self, "model", None) and getattr(self.model, "language_model", None) and not num_layers:
+                num_layers = getattr(self.model.language_model.config, "num_hidden_layers", None)
+            if num_layers is None:
+                raise AttributeError(
+                    "Model or Language Model does not expose 'num_layers' or 'num_hidden_layers' respectively. Cannot generate disagg MDP partition config."
+                )
+            mdp_ts_json_path, mdp_ts_json = generate_disagg_mdp_config(
+                onnx_path=onnx_path,
+                compile_dir=compile_dir,
+                mdp_ts_num_devices=mdp_ts_num_devices,
+                mdp_num_partitions=mdp_num_partitions,
+                mdp_strategy=mdp_strategy,
+                mdp_compiler_dump_path=mdp_compiler_dump_path,
+                num_cores=num_cores,
+                num_layers=num_layers,
+            )
+            command.append(f"-mdp-load-partition-config={mdp_ts_json_path}")
+        elif mdp_ts_num_devices > 1 and not compiler_options.get("mdp_dump_partition_config", None):
+            # Template (tensor-slice) MDP: single partition, empty nodeList; compiler fills it.
             mdp_ts_json = generate_mdp_partition_config(
                 mdp_ts_num_devices, compiler_options.get("aic_num_cores", constants.DEFAULT_AIC_NUM_CORES)
             )
@@ -1000,6 +1028,8 @@ class QEFFBaseModel(ABC):
             "specializations": specializations,
             "custom_io": custom_io,
             "mdp_ts_num_devices": mdp_ts_num_devices,
+            "mdp_num_partitions": mdp_num_partitions,
+            "mdp_strategy": mdp_strategy.value,
             "mdp_ts_json": mdp_ts_json,
             "num_speculative_tokens": num_speculative_tokens,
             "prefill_only": prefill_only,

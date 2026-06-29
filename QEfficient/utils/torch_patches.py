@@ -21,6 +21,11 @@ _safe_export_original_passes = {}
 _SAFE_EXPORT_REQUIRED_PASSES = {
     "_jit_pass_dce",
     "_jit_pass_dce_allow_deleting_nodes_with_side_effects",
+    "_jit_pass_constant_propagation",
+    "_jit_pass_cse",
+    # Keep ONNX constant fold enabled to reduce topology drift between
+    # layerwise prefill exports and regular (non-layerwise) prefill exports.
+    "_jit_pass_onnx_constant_fold",
 }
 
 
@@ -144,6 +149,14 @@ def _get_module_attributes(module):
     return attrs
 
 
+def _layerwise_safe_export_passes_enabled():
+    try:
+        from QEfficient.base.modeling_qeff import QEFFBaseModel
+    except Exception:
+        return False
+    return bool(getattr(QEFFBaseModel, "_layerwise_active", False))
+
+
 def _enable_safe_export_pass_patches(keep_passes=None):
     global _safe_export_patch_depth
 
@@ -176,13 +189,13 @@ def _disable_safe_export_pass_patches():
 def layerwise_safe_onnx_export_patches(enabled: bool = True, keep_passes=None):
     """Temporarily disable expensive ONNX exporter passes for layerwise prefill.
 
-    This is a no-op unless the caller explicitly enables it. Regular/non-layerwise
-    export should pass ``enabled=False`` so it keeps the original PyTorch ONNX
-    exporter behavior. DCE stays enabled by default because some exported graphs
-    need it to remove aten/prim nodes before PyTorch serializes ONNX.
-    ``keep_passes`` can retain additional passes.
+    This is a no-op unless the caller explicitly enables it and the process is
+    inside the layerwise export context. Regular/non-layerwise export therefore
+    keeps the original PyTorch ONNX exporter behavior. DCE stays enabled by
+    default because some exported graphs need it to remove aten/prim nodes before
+    PyTorch serializes ONNX. ``keep_passes`` can retain additional passes.
     """
-    if not enabled:
+    if not enabled or not _layerwise_safe_export_passes_enabled():
         yield
         return
 
